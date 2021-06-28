@@ -31,8 +31,10 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         l_job_id              cmn_hdl_load_job_tbl.id%TYPE;
         l_scheduler_job_name  VARCHAR2(128);
     BEGIN
+        l_scheduler_job_name := dbms_scheduler.generate_job_name('CMN_HDL_LOAD');
         INSERT INTO cmn_hdl_load_job_tbl (
-            fa_domain
+            scheduler_job_name
+            , fa_domain
             , credential_static_id
             , hdl_filename
             , hdl_author
@@ -42,7 +44,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
             , success_callback
             , failure_callback
         ) VALUES (
-            p_fa_domain
+            l_scheduler_job_name
+          , p_fa_domain
           , p_credential_static_id
           , p_hdl_filename
           , p_hdl_author
@@ -56,7 +59,6 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         COMMIT;
         
         -- Invoke scheduler job
-        l_scheduler_job_name := dbms_scheduler.generate_job_name('CMN_HDL_LOAD');
         dbms_scheduler.create_job(job_name => l_scheduler_job_name, program_name => 'CMN_HDL_LOAD', comments =>('HDL Load Job #'
                                                                                                                 || l_job_id)
                                 , enabled => false);
@@ -175,7 +177,14 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         l_job.ucm_content_id    := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_resp_xml), p_xpath => '//Document/Field[@name="dDocName"]/text()'
                                                          , p_ns => 'xmlns="http://www.oracle.com/UCM"');
 
-        l_job.job_status        := 'UPLOADED';
+        IF l_job.ucm_content_id IS NOT NULL THEN
+            l_job.job_status := 'UPLOADED';
+        ELSE
+            l_job.job_status         := 'ERROR';
+            l_job.error_http_code    := l_http_code;
+            l_job.error_msg          := l_response;
+        END IF;
+
         update_job_record(l_job);
         RETURN l_job;
     EXCEPTION
@@ -232,7 +241,14 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         l_job.hdl_process_id    := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//result/text()'
                                                          , p_ns => 'xmlns="http://xmlns.oracle.com/apps/hcm/common/dataLoader/core/dataLoaderIntegrationService/types/"');
 
-        l_job.job_status        := 'IMPORT_PENDING';
+        IF l_job.hdl_process_id IS NOT NULL THEN
+            l_job.job_status := 'IMPORT_PENDING';
+        ELSE
+            l_job.job_status         := 'ERROR';
+            l_job.error_http_code    := l_http_code;
+            l_job.error_msg          := l_response;
+        END IF;
+
         update_job_record(l_job);
         RETURN l_job;
     EXCEPTION
@@ -361,14 +377,18 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         IF l_job.job_status = 'ERROR' THEN
             l_job.job_end_ts := systimestamp;
             IF l_job.failure_callback IS NOT NULL THEN
+                l_job.callback_status := 'FAILURE_CB_EXECUTING';
+                update_job_record(l_job);
                 BEGIN
                     EXECUTE IMMEDIATE 'begin '
                                       || l_job.failure_callback
                                       || '(:1); end;'
                         USING p_job_id;
+                    l_job.callback_status := 'FAILURE_CB_COMPLETED';
                 EXCEPTION
                     WHEN OTHERS THEN
-                        l_job.callback_error_msg := sqlerrm;
+                        l_job.callback_status       := 'FAILURE_CB_FAILED';
+                        l_job.callback_error_msg    := sqlerrm;
                 END;
 
             END IF;
@@ -430,6 +450,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         , load_line_count_unprocessed = p_job.load_line_count_unprocessed
         , error_http_code = p_job.error_http_code
         , error_msg = p_job.error_msg
+        , callback_status = p_job.callback_status
+        , callback_error_msg = p_job.callback_error_msg
          WHERE
             id = p_job.id;
 
@@ -447,18 +469,23 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         l_job           := update_hdl_status(p_job_id);
         IF l_job.job_status = 'COMPLETE' THEN
             IF l_job.success_callback IS NOT NULL THEN
+                l_job.callback_status := 'SUCCESS_CB_EXECUTING';
+                update_job_record(l_job);
                 BEGIN
                     EXECUTE IMMEDIATE 'begin '
                                       || l_job.success_callback
                                       || '(:1); end;'
                         USING p_job_id;
+                    l_job.callback_status := 'SUCCESS_CB_COMPLETED';
                 EXCEPTION
                     WHEN OTHERS THEN
-                        l_job.callback_error_msg := sqlerrm;
-                        update_job_record(l_job);
+                        l_job.callback_status       := 'SUCCESS_CB_FAILED';
+                        l_job.callback_error_msg    := sqlerrm;
                 END;
+
             END IF;
 
+            update_job_record(l_job);
             RETURN;
         END IF;
         

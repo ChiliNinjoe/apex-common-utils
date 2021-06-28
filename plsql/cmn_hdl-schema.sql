@@ -4,6 +4,7 @@ CREATE TABLE cmn_hdl_load_job_tbl (
     id                             NUMBER
         GENERATED ALWAYS AS IDENTITY
     NOT NULL
+    , scheduler_job_name             VARCHAR2(128 CHAR)
     , job_status                     VARCHAR2(30 CHAR) DEFAULT ON NULL 'NEW'
     , timeout_minutes                NUMBER DEFAULT ON NULL 60
     , job_start_ts                   TIMESTAMP
@@ -17,6 +18,7 @@ CREATE TABLE cmn_hdl_load_job_tbl (
     , load_parameters                VARCHAR2(4000 CHAR)
     , success_callback               VARCHAR2(400 CHAR)
     , failure_callback               VARCHAR2(400 CHAR)
+    , callback_status                VARCHAR2(30 CHAR)
     , callback_error_msg             CLOB
     , ucm_content_id                 VARCHAR2(255 CHAR)
     , hdl_process_id                 VARCHAR2(255 CHAR)
@@ -36,6 +38,7 @@ CREATE TABLE cmn_hdl_load_job_tbl (
     , load_line_count_unprocessed    NUMBER
     , error_http_code                NUMBER
     , error_msg                      CLOB
+    , last_upd_ts                    TIMESTAMP DEFAULT ON NULL systimestamp
     , CONSTRAINT cmn_hdl_load_job_tbl_pk PRIMARY KEY ( id )
     , CONSTRAINT cmn_hdl_load_job_tbl_status_chk CHECK ( job_status IN ( 'NEW', 'UPLOAD_PENDING', 'UPLOADED'
                                                                        , 'IMPORT_PENDING'
@@ -43,8 +46,22 @@ CREATE TABLE cmn_hdl_load_job_tbl (
                                                                        , 'COMPLETE'
                                                                        , 'TIMEOUT'
                                                                        , 'ERROR' ) )
+    , CONSTRAINT cmn_hdl_load_job_tbl_cbstatus_chk CHECK ( callback_status IN ( 'SUCCESS_CB_EXECUTING'
+                                                                              , 'SUCCESS_CB_COMPLETED'
+                                                                              , 'SUCCESS_CB_FAILED'
+                                                                              , 'FAILURE_CB_EXECUTING'
+                                                                              , 'FAILURE_CB_COMPLETED'
+                                                                              , 'FAILURE_CB_FAILED' ) )
     , CONSTRAINT cmn_hdl_load_job_tbl_monitoring_chk CHECK ( load_monitoring IN ( 'ON', 'OFF' ) )
 );
+
+CREATE OR REPLACE TRIGGER cmn_hdl_load_job_tbl_trg BEFORE
+    UPDATE ON cmn_hdl_load_job_tbl
+    FOR EACH ROW
+BEGIN
+    :new.last_upd_ts := systimestamp;
+END cmn_hdl_load_job_tbl;
+/
 
 DROP TABLE cmn_hdl_load_job_audit;
 
@@ -72,6 +89,8 @@ CREATE TABLE cmn_hdl_load_job_audit (
     , load_line_count_unprocessed    NUMBER
     , error_http_code                NUMBER
     , error_msg                      CLOB
+    , callback_status                VARCHAR2(30 CHAR)
+    , callback_error_msg             CLOB
 );
 
 CREATE INDEX cmn_hdl_load_job_audit_id_ix ON
@@ -107,6 +126,8 @@ BEGIN
         , load_line_count_unprocessed
         , error_http_code
         , error_msg
+        , callback_status
+        , callback_error_msg
     ) VALUES (
         :old.id
       , :old.job_status
@@ -130,6 +151,8 @@ BEGIN
       , :old.load_line_count_unprocessed
       , :old.error_http_code
       , :old.error_msg
+      , :old.callback_status
+      , :old.callback_error_msg
     );
 
 END cmn_hdl_load_job_tbl_hist_trg;
