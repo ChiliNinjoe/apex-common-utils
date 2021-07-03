@@ -1,6 +1,10 @@
 CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
 
     c_monitoring_interval_seconds NUMBER := 10;
+    FUNCTION clob_to_blob (
+        p_data IN CLOB
+    ) RETURN BLOB;
+
     FUNCTION get_webcenter_url (
         p_domain IN VARCHAR2
     ) RETURN VARCHAR2;
@@ -502,6 +506,35 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
         -- Wait and check
         dbms_session.sleep(c_monitoring_interval_seconds);
         monitor_job(p_job_id);
+    END;
+    
+    /************************* 3rd-party Util *********************************/
+    FUNCTION clob_to_blob (
+        p_data IN CLOB
+    ) RETURN BLOB
+    -- -----------------------------------------------------------------------------------
+    -- File Name    : https://oracle-base.com/dba/miscellaneous/clob_to_blob.sql
+    -- Author       : Tim Hall
+    -- Description  : Converts a CLOB to a BLOB.
+    -- Last Modified: 26/12/2016
+    -- -----------------------------------------------------------------------------------
+     AS
+
+        l_blob          BLOB;
+        l_dest_offset   PLS_INTEGER := 1;
+        l_src_offset    PLS_INTEGER := 1;
+        l_lang_context  PLS_INTEGER := dbms_lob.default_lang_ctx;
+        l_warning       PLS_INTEGER := dbms_lob.warn_inconvertible_char;
+    BEGIN
+        dbms_lob.createtemporary(lob_loc => l_blob, cache => true);
+        dbms_lob.converttoblob(dest_lob => l_blob, src_clob => p_data, amount => dbms_lob.lobmaxsize
+                             , dest_offset => l_dest_offset
+                             , src_offset => l_src_offset
+                             , blob_csid => dbms_lob.default_csid
+                             , lang_context => l_lang_context
+                             , warning => l_warning);
+
+        RETURN l_blob;
     END;
 
 END cmn_hdl_utility_pkg;
