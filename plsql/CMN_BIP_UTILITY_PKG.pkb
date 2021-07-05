@@ -1,4 +1,14 @@
-create or replace PACKAGE BODY cmn_bip_utility_pkg AS
+CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
+
+    /*
+        TODOS
+        - encapsulate repetitive SOAP code to procedure
+        - apply chunking for report download
+        - eliminate apex_collection for table output option (to make it more dbms_scheduler friendly)
+        
+        KNOWN ISSUES
+        - parsing error on CLOB columns for adhoc sql
+    */
 
     /**************************************************************************/
     /***************************** PRIVATE AREA *******************************/
@@ -113,6 +123,63 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
 
     END create_output_column_collection;
 
+    PROCEDURE generate_select_columns_for_collection (
+        p_dp_profile     IN   CLOB
+      , p_select_sql     OUT  CLOB
+      , p_column_labels  OUT  CLOB
+    ) IS
+        l_clob_counter  INTEGER := 0;
+        l_clob_column   VARCHAR2(30);
+        l_selectcol     apex_t_varchar2;
+        l_colnames      apex_t_varchar2;
+    BEGIN
+        l_selectcol      := apex_t_varchar2();
+        l_colnames       := apex_t_varchar2();
+        FOR r IN (
+            SELECT
+                column_position
+              , column_name
+              , data_type
+              , format_mask
+              , clob_content_column
+              FROM
+                TABLE ( apex_data_parser.get_columns(p_dp_profile) ) p
+             ORDER BY
+                column_position ASC
+        ) LOOP
+            IF r.data_type = 'CLOB' THEN
+                l_clob_counter := l_clob_counter + 1;
+                IF r.clob_content_column = 'CLOB' THEN
+                    -- remediate bug in APEX_DATA_PARSER discover for clob
+                    apex_string.push(l_selectcol, 'CLOB'
+                                                  || trim(to_char(l_clob_counter, '09'))
+                                                  || ' AS "'
+                                                  || r.column_name
+                                                  || '"');
+
+                ELSE
+                    apex_string.push(l_selectcol, r.clob_content_column
+                                                  || ' AS "'
+                                                  || r.column_name
+                                                  || '"');
+                END IF;
+
+            ELSE
+                apex_string.push(l_selectcol, 'COL'
+                                              || trim(to_char(r.column_position, '009'))
+                                              || ' AS "'
+                                              || r.column_name
+                                              || '"');
+            END IF;
+
+            apex_string.push(l_colnames, r.column_name);
+        END LOOP;
+
+        p_select_sql     := 'SELECT '
+                        || apex_string.join_clob(l_selectcol, ',');
+        p_column_labels  := apex_string.join_clob(l_colnames, ':');
+    END generate_select_columns_for_collection;
+
     PROCEDURE retrieve_session_token (
         p_credentials IN OUT NOCOPY cmn_credentials_pkg.acct_creds
     ) IS
@@ -149,7 +216,7 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
             l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
                          , l_response);
 
-            raise_application_error(-20100, 'HTTP '
+            raise_application_error(-20100, '[retrieve_session_token] HTTP '
                                             || l_http_code
                                             || ': '
                                             || l_error);
@@ -160,45 +227,88 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
 
     END retrieve_session_token;
 
+    PROCEDURE invalidate_session_token (
+        p_credentials IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+    ) IS
+        l_payload    CLOB;
+        l_http_code  NUMBER;
+        l_response   CLOB;
+        l_error      CLOB;
+    BEGIN
+        l_payload                      := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
+   <soapenv:Header/>
+   <soapenv:Body>
+      <v2:logout>
+         <v2:bipSessionToken>%0</v2:bipSessionToken>
+      </v2:logout>
+   </soapenv:Body>
+</soapenv:Envelope>'
+                                      , p_credentials.session_token);
+        --
+        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
+                                           , p_value_01 => 'text/xml;charset=UTF-8'
+                                           , p_name_02 => 'SOAPAction'
+                                           , p_value_02 => ''
+                                           , p_reset => true
+                                           , p_skip_if_exists => true);
+
+        l_response                     := apex_web_service.make_rest_request(p_url => get_securityservice_url(p_credentials)
+                                                       , p_http_method => 'POST'
+                                                       , p_body => l_payload);
+
+        l_http_code                    := apex_web_service.g_status_code;
+        IF l_http_code <> 200 THEN
+            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
+                         , l_response);
+
+            raise_application_error(-20100, '[retrieve_session_token] HTTP '
+                                            || l_http_code
+                                            || ': '
+                                            || l_error);
+        END IF;
+
+        p_credentials.session_token    := NULL;
+    END invalidate_session_token;
+
     FUNCTION get_dm_for_sql (
         p_sql IN CLOB
     ) RETURN CLOB IS
     BEGIN
         RETURN '<?xml version = ''1.0'' encoding = ''utf-8''?>
 <dataModel xmlns="http://xmlns.oracle.com/oxp/xmlp" version="2.0" xmlns:xdm="http://xmlns.oracle.com/oxp/xmlp" xmlns:xsd="http://wwww.w3.org/2001/XMLSchema" defaultDataSourceRef="demo">
-       <description> 
-              <![CDATA[Generic Data Model]]>
-       </description>
-       <dataProperties>
-              <property name="include_parameters" value="true" />
-              <property name="include_null_Element" value="false" />
-              <property name="include_rowsettag" value="false" />
-              <property name="xml_tag_case" value="upper" />
-       </dataProperties>
-       <dataSets>
-              <dataSet name="GENERIC_DATASET" type="simple">
-                     <sql dataSourceRef="ApplicationDB_HCM" nsQuery="true" xmlRowTagName="" bindMultiValueAsCommaSepStr="false"> 
-                           <![CDATA['
+<description> 
+<![CDATA[Generic Data Model]]>
+</description>
+<dataProperties>
+<property name="include_parameters" value="true" />
+<property name="include_null_Element" value="false" />
+<property name="include_rowsettag" value="false" />
+<property name="xml_tag_case" value="upper" />
+</dataProperties>
+<dataSets>
+<dataSet name="GENERIC_DATASET" type="simple">
+<sql dataSourceRef="ApplicationDB_HCM" nsQuery="true" xmlRowTagName="" bindMultiValueAsCommaSepStr="false"> 
+<![CDATA['
                || p_sql
                || ']]>
-                     </sql>
-              </dataSet>
-       </dataSets>
-       <output rootName="DATA_DS" uniqueRowName="false">
-              <nodeList name="GENERIC_DATASET" />
-       </output>
-       <eventTriggers />
-       <lexicals />
-       <valueSets />
-       <parameters />
-       <bursting />
-       <display>
-              <layouts>
-                     <layout name="GENERIC_DATASET" left="281px" top="0px" />
-                     <layout name="DATA_DS" left="1px" top="289px" />
-              </layouts>
-              <groupLinks />
-       </display>
+</sql>
+</dataSet>
+</dataSets>
+<output rootName="DATA_DS" uniqueRowName="false">
+<nodeList name="GENERIC_DATASET" />
+</output>
+<eventTriggers />
+<lexicals />
+<valueSets />
+<parameters />
+<bursting />
+<display>
+<layouts>
+<layout name="GENERIC_DATASET" left="281px" top="0px" />
+<layout name="DATA_DS" left="1px" top="289px" />
+</layouts>
+<groupLinks />
+</display>
 </dataModel>';
     END get_dm_for_sql;
 
@@ -736,6 +846,59 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
     /*************************** PUBLIC INTERFACE *****************************/
     /**************************************************************************/
 
+    FUNCTION is_credential_valid (
+        p_credentials IN cmn_credentials_pkg.acct_creds
+    ) RETURN BOOLEAN IS
+        l_payload    CLOB;
+        l_http_code  NUMBER;
+        l_response   CLOB;
+        l_error      CLOB;
+        l_result     VARCHAR2(30);
+    BEGIN
+        l_payload    := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
+   <soapenv:Header/>
+   <soapenv:Body>
+      <v2:validateLogin>
+         <v2:userID>%0</v2:userID>
+         <v2:password>%1</v2:password>
+      </v2:validateLogin>
+   </soapenv:Body>
+</soapenv:Envelope>'
+                                      , p_credentials.username
+                                      , p_credentials.password);
+        --
+        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
+                                           , p_value_01 => 'text/xml;charset=UTF-8'
+                                           , p_name_02 => 'SOAPAction'
+                                           , p_value_02 => ''
+                                           , p_reset => true
+                                           , p_skip_if_exists => true);
+
+        l_response   := apex_web_service.make_rest_request(p_url => get_securityservice_url(p_credentials)
+                                                       , p_http_method => 'POST'
+                                                       , p_body => l_payload);
+
+        l_http_code  := apex_web_service.g_status_code;
+        IF l_http_code <> 200 THEN
+            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
+                         , l_response);
+
+            raise_application_error(-20100, '[is_credential_valid] HTTP '
+                                            || l_http_code
+                                            || ': '
+                                            || l_error);
+        END IF;
+
+        l_result     := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//validateLoginResponse/validateLoginReturn/text()'
+                                             , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
+
+        IF upper(l_result) = 'TRUE' THEN
+            RETURN true;
+        ELSE
+            RETURN false;
+        END IF;
+    END is_credential_valid;
+
     PROCEDURE create_data_model (
         p_path         IN  VARCHAR2
       , p_name         IN  VARCHAR2
@@ -762,7 +925,7 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
 
         IF data_model_exists(p_path => p_path, p_name => p_name, p_credentials => p_credentials) = true THEN
             apex_debug.trace('DM Exists');
-            IF p_replace = 'Y' THEN
+            IF upper(p_replace) = 'Y' THEN
                 apex_debug.trace('Deleting DM ...');
                 delete_data_model(p_path => p_path, p_name => p_name, p_credentials => p_credentials);
             ELSE
@@ -794,21 +957,94 @@ create or replace PACKAGE BODY cmn_bip_utility_pkg AS
                        , p_parameters => p_parameters
                        , p_bip_output => l_bip_output);
 
+        invalidate_session_token(p_credentials);
+        --
         load_table_from_xml(p_schema_name => p_schema_name, p_table_name => p_table_name, p_bip_output => l_bip_output
                           , p_rows => p_rows);
 
     END load_data_model_to_table;
 
     PROCEDURE load_data_model_to_collection (
-        p_path             IN   VARCHAR2
-      , p_name             IN   VARCHAR2
-      , p_credentials      IN   cmn_credentials_pkg.acct_creds
-      , p_parameters       IN   apex_t_varchar2 DEFAULT NULL
-      , p_collection_name  IN   VARCHAR2
-      , p_rows             OUT  NUMBER
+        p_path             IN  VARCHAR2
+      , p_name             IN  VARCHAR2
+      , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+      , p_parameters       IN  apex_t_varchar2 DEFAULT NULL
+      , p_collection_name  IN  VARCHAR2
     ) IS
+        l_bip_output     bip_output;
+        l_select_sql     CLOB;
+        l_column_labels  CLOB;
+        l_sql_query      CLOB;
     BEGIN
-        NULL;  -- STUB
+        retrieve_dm_data(p_path => p_path, p_name => p_name, p_credentials => p_credentials
+                       , p_parameters => p_parameters
+                       , p_bip_output => l_bip_output);
+
+        invalidate_session_token(p_credentials);
+        --
+        apex_collection.create_or_truncate_collection(p_collection_name => p_collection_name);
+        generate_select_columns_for_collection(p_dp_profile => l_bip_output.dp_profile
+                                             , p_select_sql => l_select_sql
+                                             , p_column_labels => l_column_labels);
+
+        -- Add BIP output LOBs to collection
+        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'BIP_OUTPUT_LOB'
+                                 , p_clob001 => l_bip_output.dp_profile
+                                 , p_blob001 => l_bip_output.output_content_xml);
+
+        -- Add SQL Query to collection
+        l_sql_query := l_select_sql
+                       || ' FROM apex_collections ac, TABLE ( apex_data_parser.parse(p_content => ac.blob001, p_file_name => ''dummy.xml'', p_file_profile => ac.clob001, p_row_selector => ''/ROWSET/ROW'') ) '
+                       || ' WHERE ac.collection_name = '''
+                       || p_collection_name
+                       || ''' AND c001 = ''BIP_OUTPUT_LOB''';
+        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'SELECT_QUERY'
+                                 , p_clob001 => l_sql_query);
+
+        -- Add column list to collection
+        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'COLUMN_LIST'
+                                 , p_clob001 => l_column_labels);
+
     END load_data_model_to_collection;
+
+    FUNCTION get_query_for_collection (
+        p_collection_name IN VARCHAR2
+    ) RETURN CLOB IS
+        l_result CLOB;
+    BEGIN
+        SELECT
+            clob001
+          INTO l_result
+          FROM
+            apex_collections
+         WHERE
+                collection_name = p_collection_name
+               AND c001 = 'SELECT_QUERY';
+
+        RETURN l_result;
+    EXCEPTION
+        WHEN no_data_found THEN
+            RETURN 'SELECT DUMMY FROM DUAL';
+    END get_query_for_collection;
+
+    FUNCTION get_columns_for_collection (
+        p_collection_name IN VARCHAR2
+    ) RETURN CLOB IS
+        l_result CLOB;
+    BEGIN
+        SELECT
+            clob001
+          INTO l_result
+          FROM
+            apex_collections
+         WHERE
+                collection_name = p_collection_name
+               AND c001 = 'COLUMN_LIST';
+
+        RETURN l_result;
+    EXCEPTION
+        WHEN no_data_found THEN
+            RETURN 'DUMMY';
+    END get_columns_for_collection;
 
 END cmn_bip_utility_pkg;
