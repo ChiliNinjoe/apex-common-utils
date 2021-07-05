@@ -1,4 +1,4 @@
-CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
+create or replace PACKAGE BODY cmn_hdl_utility_pkg IS
 
     c_monitoring_interval_seconds NUMBER := 10;
     FUNCTION clob_to_blob (
@@ -141,16 +141,17 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
                     <ucm:Field name="dDocAccount">hcm$/dataloader$/import$</ucm:Field>
                     <ucm:Field name="primaryFile">%1</ucm:Field>
                     <ucm:File href="%1" name="primaryFile">
-                        <ucm:Contents>%2</ucm:Contents>
+                        <ucm:Contents>'
+                                      , l_job.hdl_author
+                                      , l_job.hdl_filename)
+                     || l_fileblob_b64
+                     || '</ucm:Contents>
                     </ucm:File>
                 </ucm:Document>
             </ucm:Service>
         </ucm:GenericRequest>
     </soapenv:Body>
-</soapenv:Envelope>'
-                                      , l_job.hdl_author
-                                      , l_job.hdl_filename
-                                      , l_fileblob_b64);
+</soapenv:Envelope>';
 
         l_job.job_status        := 'UPLOAD_PENDING';
         update_job_record(l_job);
@@ -535,6 +536,6 @@ CREATE OR REPLACE PACKAGE BODY cmn_hdl_utility_pkg IS
                              , warning => l_warning);
 
         RETURN l_blob;
-    END;
+    END clob_to_blob;
 
 END cmn_hdl_utility_pkg;
