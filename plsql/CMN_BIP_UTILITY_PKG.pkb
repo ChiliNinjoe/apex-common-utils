@@ -2,9 +2,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
     /*
         TODOS
-        - encapsulate repetitive SOAP code to procedure
+        - handling of SQL errors and no rows in results
+        - REFACTOR: encapsulate repetitive SOAP code to procedure
         - apply chunking for report download
-        - eliminate apex_collection for table output option (to make it more dbms_scheduler friendly)
         
         KNOWN ISSUES
         - parsing error on CLOB columns for adhoc sql
@@ -14,8 +14,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     /***************************** PRIVATE AREA *******************************/
     /**************************************************************************/
 
-    c_bip_output_metadata  CONSTANT VARCHAR2(60) := 'CMN_BIP_OUTPUT_METADATA';
-    c_dummy_xml_filename   CONSTANT VARCHAR2(60) := 'bipoutput.xml';
+    c_dummy_xml_filename CONSTANT VARCHAR2(60) := 'bipoutput.xml';
     --
     TYPE bip_output IS RECORD (
         output_content_xml  BLOB
@@ -79,49 +78,6 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                               , 1, 'i', 2) -- extract domain only in case full URL is specfied
                || '/xmlpserver/services/v2/ReportService';
     END get_reportservice_url;
-
-    PROCEDURE create_output_column_collection (
-        p_dp_profile IN CLOB
-    ) IS
-        l_clob_counter  INTEGER := 0;
-        l_clob_column   VARCHAR2(30);
-    BEGIN
-        apex_collection.create_or_truncate_collection(p_collection_name => c_bip_output_metadata);
-        FOR r IN (
-            SELECT
-                column_position
-              , column_name
-              , data_type
-              , format_mask
-              , clob_content_column
-              FROM
-                TABLE ( apex_data_parser.get_columns(p_dp_profile) ) p
-             ORDER BY
-                column_position ASC
-        ) LOOP
-            IF r.data_type = 'CLOB' THEN
-                -- remediate bug in APEX_DATA_PARSER discover for clob
-                l_clob_counter := l_clob_counter + 1;
-                IF r.clob_content_column = 'CLOB' THEN
-                    l_clob_column := 'CLOB'
-                                     || trim(to_char(l_clob_counter, '09'));
-                ELSE
-                    l_clob_column := r.clob_content_column;
-                END IF;
-
-            ELSE
-                l_clob_column := NULL;
-            END IF;
-
-            apex_collection.add_member(p_collection_name => c_bip_output_metadata, p_n001 => r.column_position
-                                     , p_c001 => r.column_name
-                                     , p_c002 => r.data_type
-                                     , p_c003 => replace(r.format_mask, '"')
-                                     , p_c004 => l_clob_column);
-
-        END LOOP;
-
-    END create_output_column_collection;
 
     PROCEDURE generate_select_columns_for_collection (
         p_dp_profile     IN   CLOB
@@ -283,6 +239,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 <property name="include_parameters" value="true" />
 <property name="include_null_Element" value="false" />
 <property name="include_rowsettag" value="false" />
+<property name="exclude_tags_for_lob" value="false"/>
 <property name="xml_tag_case" value="upper" />
 </dataProperties>
 <dataSets>
@@ -584,25 +541,22 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                                            , p_file_name => c_dummy_xml_filename
                                                            , p_row_selector => '/ROWSET/ROW');
 
-        create_output_column_collection(p_bip_output.dp_profile);
     END retrieve_dm_data;
 
-    FUNCTION get_column_ddl RETURN CLOB IS
+    FUNCTION get_column_ddl (
+        p_dp_profile IN CLOB
+    ) RETURN CLOB IS
         l_return CLOB;
     BEGIN
         FOR c IN (
             SELECT
-                n001  AS column_position
-              , c001  AS column_name
-              , c002  AS data_type
-              , c003  AS format_mask
-              , c004  AS clob_content_column
+                column_position
+              , column_name
+              , data_type
               FROM
-                apex_collections
-             WHERE
-                collection_name = c_bip_output_metadata
+                TABLE ( apex_data_parser.get_columns(p_dp_profile) ) p
              ORDER BY
-                n001
+                column_position ASC
         ) LOOP
             IF c.column_position = 1 THEN
                 l_return := '"'
@@ -628,6 +582,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     PROCEDURE create_output_table (
         p_schema_name  IN  VARCHAR2
       , p_table_name   IN  VARCHAR2
+      , p_dp_profile   IN  CLOB
     ) IS
         l_sql CLOB;
     BEGIN
@@ -636,7 +591,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                  || '.'
                  || p_table_name
                  || '('
-                 || get_column_ddl
+                 || get_column_ddl(p_dp_profile)
                  || ')';
 
         apex_debug.message('Create SQL: ' || l_sql);
@@ -658,6 +613,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_headercol                 apex_t_varchar2;
         l_selectcol                 apex_t_varchar2;
         l_insert_sql                CLOB;
+        --
+        l_clob_counter              INTEGER := 0;
+        l_clob_column               VARCHAR2(30);
     BEGIN
         BEGIN
             SELECT
@@ -676,25 +634,37 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         IF l_table_exists = 'N' THEN
             apex_debug.trace('=== Creating table to be loaded ===');
-            create_output_table(p_schema_name, p_table_name);
+            create_output_table(p_schema_name, p_table_name, p_bip_output.dp_profile);
         END IF;
 
         l_headercol   := apex_t_varchar2();
         l_selectcol   := apex_t_varchar2();
         FOR i IN (
             SELECT
-                n001  AS column_position
-              , c001  AS column_name
-              , c002  AS data_type
-              , c003  AS format_mask
-              , c004  AS clob_content_column
+                column_position
+              , column_name
+              , data_type
+              , replace(format_mask, '"') AS format_mask
+              , clob_content_column
               FROM
-                apex_collections
-             WHERE
-                collection_name = c_bip_output_metadata
+                TABLE ( apex_data_parser.get_columns(p_bip_output.dp_profile) ) p
              ORDER BY
-                n001
+                column_position ASC
         ) LOOP
+            IF i.data_type = 'CLOB' THEN
+                -- remediate bug in APEX_DATA_PARSER discover for clob
+                l_clob_counter := l_clob_counter + 1;
+                IF i.clob_content_column = 'CLOB' THEN
+                    l_clob_column := 'CLOB'
+                                     || trim(to_char(l_clob_counter, '09'));
+                ELSE
+                    l_clob_column := i.clob_content_column;
+                END IF;
+
+            ELSE
+                l_clob_column := NULL;
+            END IF;
+            --
             BEGIN
                 SELECT
                     'Y'
@@ -765,10 +735,10 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                               || '"');
                 IF
                     i.data_type = 'CLOB'
-                    AND i.clob_content_column IS NOT NULL
+                    AND l_clob_column IS NOT NULL
                 THEN
                     apex_string.push(l_selectcol, 'NVL('
-                                                  || i.clob_content_column
+                                                  || l_clob_column
                                                   || ','
                                                   || 'COL'
                                                   || trim(to_char(i.column_position, '009'))
