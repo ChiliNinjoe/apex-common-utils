@@ -3,7 +3,6 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     /*
         TODOS
         - handling of SQL errors and no rows in results
-        - REFACTOR: encapsulate repetitive SOAP code to procedure
         - apply chunking for report download
         
         KNOWN ISSUES
@@ -79,62 +78,48 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                || '/xmlpserver/services/v2/ReportService';
     END get_reportservice_url;
 
-    PROCEDURE generate_select_columns_for_collection (
-        p_dp_profile     IN   CLOB
-      , p_select_sql     OUT  CLOB
-      , p_column_labels  OUT  CLOB
+    PROCEDURE send_soap_request (
+        p_endpoint  IN   VARCHAR2
+      , p_caller    IN   VARCHAR2
+      , p_payload   IN   CLOB
+      , p_response  OUT  CLOB
     ) IS
-        l_clob_counter  INTEGER := 0;
-        l_clob_column   VARCHAR2(30);
-        l_selectcol     apex_t_varchar2;
-        l_colnames      apex_t_varchar2;
+        l_soap_payload  CLOB;
+        l_http_code     NUMBER;
+        l_error         CLOB;
     BEGIN
-        l_selectcol      := apex_t_varchar2();
-        l_colnames       := apex_t_varchar2();
-        FOR r IN (
-            SELECT
-                column_position
-              , column_name
-              , data_type
-              , format_mask
-              , clob_content_column
-              FROM
-                TABLE ( apex_data_parser.get_columns(p_dp_profile) ) p
-             ORDER BY
-                column_position ASC
-        ) LOOP
-            IF r.data_type = 'CLOB' THEN
-                l_clob_counter := l_clob_counter + 1;
-                IF r.clob_content_column = 'CLOB' THEN
-                    -- remediate bug in APEX_DATA_PARSER discover for clob
-                    apex_string.push(l_selectcol, 'CLOB'
-                                                  || trim(to_char(l_clob_counter, '09'))
-                                                  || ' AS "'
-                                                  || r.column_name
-                                                  || '"');
+        l_soap_payload  := '<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
+   <soapenv:Header/>
+   <soapenv:Body>'
+                          || p_payload
+                          || '</soapenv:Body>
+</soapenv:Envelope>';
+        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
+                                           , p_value_01 => 'text/xml;charset=UTF-8'
+                                           , p_name_02 => 'SOAPAction'
+                                           , p_value_02 => ''
+                                           , p_reset => true
+                                           , p_skip_if_exists => true);
 
-                ELSE
-                    apex_string.push(l_selectcol, r.clob_content_column
-                                                  || ' AS "'
-                                                  || r.column_name
-                                                  || '"');
-                END IF;
+        p_response      := apex_web_service.make_rest_request(p_url => p_endpoint
+                                                       , p_http_method => 'POST'
+                                                       , p_body => l_soap_payload);
 
-            ELSE
-                apex_string.push(l_selectcol, 'COL'
-                                              || trim(to_char(r.column_position, '009'))
-                                              || ' AS "'
-                                              || r.column_name
-                                              || '"');
-            END IF;
+        l_http_code     := apex_web_service.g_status_code;
+        IF l_http_code <> 200 THEN
+            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(p_response), p_xpath => '//faultstring[1]/text()')
+                         , p_response);
 
-            apex_string.push(l_colnames, r.column_name);
-        END LOOP;
+            raise_application_error(-20100, '['
+                                            || p_caller
+                                            || '] HTTP '
+                                            || l_http_code
+                                            || ': '
+                                            || l_error);
 
-        p_select_sql     := 'SELECT '
-                        || apex_string.join_clob(l_selectcol, ',');
-        p_column_labels  := apex_string.join_clob(l_colnames, ':');
-    END generate_select_columns_for_collection;
+        END IF;
+
+    END send_soap_request;
 
     PROCEDURE retrieve_session_token (
         p_credentials IN OUT NOCOPY cmn_credentials_pkg.acct_creds
@@ -144,39 +129,16 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_response   CLOB;
         l_error      CLOB;
     BEGIN
-        l_payload                      := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:login>
+        l_payload                      := apex_string.format('<v2:login>
          <v2:userID>%0</v2:userID>
          <v2:password>%1</v2:password>
-      </v2:login>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:login>'
                                       , p_credentials.username
                                       , p_credentials.password);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
-
-        l_response                     := apex_web_service.make_rest_request(p_url => get_securityservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code                    := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[retrieve_session_token] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
+        send_soap_request(p_endpoint => get_securityservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
         p_credentials.session_token    := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//loginResponse/loginReturn/text()'
                                                                 , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
@@ -191,37 +153,14 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_response   CLOB;
         l_error      CLOB;
     BEGIN
-        l_payload                      := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:logout>
+        l_payload                      := apex_string.format('<v2:logout>
          <v2:bipSessionToken>%0</v2:bipSessionToken>
-      </v2:logout>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:logout>'
                                       , p_credentials.session_token);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
-
-        l_response                     := apex_web_service.make_rest_request(p_url => get_securityservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code                    := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[retrieve_session_token] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
+        send_soap_request(p_endpoint => get_securityservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
         p_credentials.session_token    := NULL;
     END invalidate_session_token;
@@ -285,15 +224,10 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         END IF;
         --
 
-        l_payload    := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:objectExistInSession>
+        l_payload  := apex_string.format('<v2:objectExistInSession>
          <v2:reportObjectAbsolutePath>%0</v2:reportObjectAbsolutePath>
          <v2:bipSessionToken>%1</v2:bipSessionToken>
-      </v2:objectExistInSession>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:objectExistInSession>'
                                       , trim(TRAILING '/' FROM p_path)
                                           || '/'
                                           || regexp_replace(p_name, '\.xdm$', ''
@@ -301,29 +235,11 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                           || '.xdm'
                                       , p_credentials.session_token);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
-        l_response   := apex_web_service.make_rest_request(p_url => get_catalogservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code  := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[data_model_exists] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
-
-        l_result     := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//objectExistInSessionResponse/objectExistInSessionReturn/text()'
+        l_result   := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//objectExistInSessionResponse/objectExistInSessionReturn/text()'
                                              , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
 
         IF upper(l_result) = 'TRUE' THEN
@@ -349,15 +265,10 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         END IF;
         --
 
-        l_payload    := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:deleteObjectInSession>
+        l_payload := apex_string.format('<v2:deleteObjectInSession>
          <v2:objectAbsolutePath>%0</v2:objectAbsolutePath>
          <v2:bipSessionToken>%1</v2:bipSessionToken>
-      </v2:deleteObjectInSession>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:deleteObjectInSession>'
                                       , trim(TRAILING '/' FROM p_path)
                                           || '/'
                                           || regexp_replace(p_name, '\.xdm$', ''
@@ -365,27 +276,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                           || '.xdm'
                                       , p_credentials.session_token);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
-
-        l_response   := apex_web_service.make_rest_request(p_url => get_catalogservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code  := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[delete_data_model] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
     END delete_data_model;
 
@@ -405,10 +298,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         END IF;
         --
 
-        l_payload    := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:createObjectInSession>
+        l_payload := apex_string.format('<v2:createObjectInSession>
          <v2:folderAbsolutePathURL>%0</v2:folderAbsolutePathURL>
          <v2:objectName>%1</v2:objectName>
          <v2:objectType>xdm</v2:objectType>
@@ -421,33 +311,13 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                      || apex_web_service.blob2clobbase64(clob_to_blob(p_xdm_xml))
                      || apex_string.format('</v2:objectData>
          <v2:bipSessionToken>%0</v2:bipSessionToken>
-      </v2:createObjectInSession>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:createObjectInSession>'
                                          , p_credentials.session_token);
 
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
-
-        l_response   := apex_web_service.make_rest_request(p_url => get_catalogservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code  := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[post_data_model] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
     END post_data_model;
 
@@ -490,19 +360,14 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         END IF;
 
-        l_payload                          := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:runDataModelInSession>
+        l_payload                          := apex_string.format('<v2:runDataModelInSession>
          <v2:reportRequest>
             %0
             <v2:reportAbsolutePath>%1</v2:reportAbsolutePath>
             <v2:sizeOfDataChunkDownload>-1</v2:sizeOfDataChunkDownload>
          </v2:reportRequest>
          <v2:bipSessionToken>%2</v2:bipSessionToken>
-      </v2:runDataModelInSession>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:runDataModelInSession>'
                                       , l_param_node
                                       , trim(TRAILING '/' FROM p_path)
                                           || '/'
@@ -511,27 +376,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                           || '.xdm'
                                       , p_credentials.session_token);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
-
-        l_response                         := apex_web_service.make_rest_request(p_url => get_reportservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code                        := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[retrieve_dm_data] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
+        send_soap_request(p_endpoint => get_reportservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
         l_output_clob                      := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response), p_xpath => '//runDataModelInSessionResponse/runDataModelInSessionReturn/reportBytes/text()'
                                                        , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
@@ -812,6 +659,63 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         --
     END load_table_from_xml;
 
+    PROCEDURE generate_select_columns_for_collection (
+        p_dp_profile     IN   CLOB
+      , p_select_sql     OUT  CLOB
+      , p_column_labels  OUT  CLOB
+    ) IS
+        l_clob_counter  INTEGER := 0;
+        l_clob_column   VARCHAR2(30);
+        l_selectcol     apex_t_varchar2;
+        l_colnames      apex_t_varchar2;
+    BEGIN
+        l_selectcol      := apex_t_varchar2();
+        l_colnames       := apex_t_varchar2();
+        FOR r IN (
+            SELECT
+                column_position
+              , column_name
+              , data_type
+              , format_mask
+              , clob_content_column
+              FROM
+                TABLE ( apex_data_parser.get_columns(p_dp_profile) ) p
+             ORDER BY
+                column_position ASC
+        ) LOOP
+            IF r.data_type = 'CLOB' THEN
+                l_clob_counter := l_clob_counter + 1;
+                IF r.clob_content_column = 'CLOB' THEN
+                    -- remediate bug in APEX_DATA_PARSER discover for clob
+                    apex_string.push(l_selectcol, 'CLOB'
+                                                  || trim(to_char(l_clob_counter, '09'))
+                                                  || ' AS "'
+                                                  || r.column_name
+                                                  || '"');
+
+                ELSE
+                    apex_string.push(l_selectcol, r.clob_content_column
+                                                  || ' AS "'
+                                                  || r.column_name
+                                                  || '"');
+                END IF;
+
+            ELSE
+                apex_string.push(l_selectcol, 'COL'
+                                              || trim(to_char(r.column_position, '009'))
+                                              || ' AS "'
+                                              || r.column_name
+                                              || '"');
+            END IF;
+
+            apex_string.push(l_colnames, r.column_name);
+        END LOOP;
+
+        p_select_sql     := 'SELECT '
+                        || apex_string.join_clob(l_selectcol, ',');
+        p_column_labels  := apex_string.join_clob(l_colnames, ':');
+    END generate_select_columns_for_collection;
+
     /**************************************************************************/
     /*************************** PUBLIC INTERFACE *****************************/
     /**************************************************************************/
@@ -825,41 +729,18 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_error      CLOB;
         l_result     VARCHAR2(30);
     BEGIN
-        l_payload    := apex_string.format('<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:v2="http://xmlns.oracle.com/oxp/service/v2">
-   <soapenv:Header/>
-   <soapenv:Body>
-      <v2:validateLogin>
+        l_payload  := apex_string.format('<v2:validateLogin>
          <v2:userID>%0</v2:userID>
          <v2:password>%1</v2:password>
-      </v2:validateLogin>
-   </soapenv:Body>
-</soapenv:Envelope>'
+      </v2:validateLogin>'
                                       , p_credentials.username
                                       , p_credentials.password);
         --
-        apex_web_service.set_request_headers(p_name_01 => 'Content-Type'
-                                           , p_value_01 => 'text/xml;charset=UTF-8'
-                                           , p_name_02 => 'SOAPAction'
-                                           , p_value_02 => ''
-                                           , p_reset => true
-                                           , p_skip_if_exists => true);
+        send_soap_request(p_endpoint => get_securityservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
 
-        l_response   := apex_web_service.make_rest_request(p_url => get_securityservice_url(p_credentials)
-                                                       , p_http_method => 'POST'
-                                                       , p_body => l_payload);
-
-        l_http_code  := apex_web_service.g_status_code;
-        IF l_http_code <> 200 THEN
-            l_error := nvl(apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//faultstring[1]/text()')
-                         , l_response);
-
-            raise_application_error(-20100, '[is_credential_valid] HTTP '
-                                            || l_http_code
-                                            || ': '
-                                            || l_error);
-        END IF;
-
-        l_result     := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//validateLoginResponse/validateLoginReturn/text()'
+        l_result   := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//validateLoginResponse/validateLoginReturn/text()'
                                              , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
 
         IF upper(l_result) = 'TRUE' THEN
