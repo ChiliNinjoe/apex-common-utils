@@ -6,12 +6,18 @@ CREATE OR REPLACE PACKAGE cmn_bip_utility_pkg AS
         p_credentials IN cmn_credentials_pkg.acct_creds
     ) RETURN BOOLEAN;
 
+    PROCEDURE create_folder (
+        p_path         IN  VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+    );
+
     PROCEDURE create_data_model (
         p_path         IN  VARCHAR2
       , p_name         IN  VARCHAR2
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
       , p_sql          IN  CLOB DEFAULT NULL -- SELECT ONE: Provide sql
       , p_xdm_xml      IN  CLOB DEFAULT NULL --          or xdm XML
+      , p_data_source  IN  VARCHAR DEFAULT 'ApplicationDB_HCM'
       , p_replace      IN  VARCHAR2 DEFAULT 'N'
     );
 
@@ -27,11 +33,11 @@ CREATE OR REPLACE PACKAGE cmn_bip_utility_pkg AS
     );
 
     PROCEDURE load_data_model_to_collection (
-        p_path             IN   VARCHAR2
-      , p_name             IN   VARCHAR2
+        p_path             IN  VARCHAR2
+      , p_name             IN  VARCHAR2
       , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
-      , p_parameters       IN   apex_t_varchar2 DEFAULT NULL
-      , p_collection_name  IN   VARCHAR2
+      , p_parameters       IN  apex_t_varchar2 DEFAULT NULL
+      , p_collection_name  IN  VARCHAR2
     );
 
     FUNCTION get_query_for_collection (

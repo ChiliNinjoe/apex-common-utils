@@ -2,8 +2,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
     /*
         TODOS
-        - handling of SQL errors and no rows in results
         - apply chunking for report download
+        - parsing of parameters from sql
+        - list folder contents
         
         KNOWN ISSUES
         - parsing error on CLOB columns for adhoc sql
@@ -124,10 +125,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     PROCEDURE retrieve_session_token (
         p_credentials IN OUT NOCOPY cmn_credentials_pkg.acct_creds
     ) IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_error      CLOB;
+        l_payload   CLOB;
+        l_response  CLOB;
     BEGIN
         l_payload                      := apex_string.format('<v2:login>
          <v2:userID>%0</v2:userID>
@@ -148,10 +147,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     PROCEDURE invalidate_session_token (
         p_credentials IN OUT NOCOPY cmn_credentials_pkg.acct_creds
     ) IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_error      CLOB;
+        l_payload   CLOB;
+        l_response  CLOB;
     BEGIN
         l_payload                      := apex_string.format('<v2:logout>
          <v2:bipSessionToken>%0</v2:bipSessionToken>
@@ -166,7 +163,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     END invalidate_session_token;
 
     FUNCTION get_dm_for_sql (
-        p_sql IN CLOB
+        p_sql          IN  CLOB
+      , p_data_source  IN  VARCHAR2 DEFAULT 'ApplicationDB_HCM'
     ) RETURN CLOB IS
     BEGIN
         RETURN '<?xml version = ''1.0'' encoding = ''utf-8''?>
@@ -183,7 +181,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 </dataProperties>
 <dataSets>
 <dataSet name="GENERIC_DATASET" type="simple">
-<sql dataSourceRef="ApplicationDB_HCM" nsQuery="true" xmlRowTagName="" bindMultiValueAsCommaSepStr="false"> 
+<sql dataSourceRef="'
+               || p_data_source
+               || '" nsQuery="true" xmlRowTagName="" bindMultiValueAsCommaSepStr="false"> 
 <![CDATA['
                || p_sql
                || ']]>
@@ -213,11 +213,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_name         IN  VARCHAR2
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
     ) RETURN BOOLEAN IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_result     VARCHAR2(30);
-        l_error      CLOB;
+        l_payload   CLOB;
+        l_response  CLOB;
+        l_result    VARCHAR2(30);
     BEGIN
         IF p_credentials.session_token IS NULL THEN
             retrieve_session_token(p_credentials);
@@ -254,11 +252,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_name         IN  VARCHAR2
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
     ) IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_result     VARCHAR2(30);
-        l_error      CLOB;
+        l_payload   CLOB;
+        l_response  CLOB;
+        l_result    VARCHAR2(30);
     BEGIN
         IF p_credentials.session_token IS NULL THEN
             retrieve_session_token(p_credentials);
@@ -288,10 +284,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
       , p_xdm_xml      IN  CLOB
     ) IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_error      CLOB;
+        l_payload   CLOB;
+        l_response  CLOB;
     BEGIN
         IF p_credentials.session_token IS NULL THEN
             retrieve_session_token(p_credentials);
@@ -332,10 +326,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_param_node   CLOB;
         l_param_items  CLOB;
         l_payload      CLOB;
-        l_http_code    NUMBER;
         l_response     CLOB;
         l_output_clob  CLOB;
-        l_error        CLOB;
+        l_sqlerror     VARCHAR2(32767);
     BEGIN
         IF p_credentials.session_token IS NULL THEN
             retrieve_session_token(p_credentials);
@@ -376,17 +369,37 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                           || '.xdm'
                                       , p_credentials.session_token);
         --
-        send_soap_request(p_endpoint => get_reportservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
-                        , p_payload => l_payload
-                        , p_response => l_response);
+        BEGIN
+            send_soap_request(p_endpoint => get_reportservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                            , p_payload => l_payload
+                            , p_response => l_response);
+        EXCEPTION
+            WHEN OTHERS THEN
+                l_sqlerror := regexp_substr(sqlerrm, 'java.sql.SQLSyntaxErrorException:.*');
+                IF l_sqlerror IS NOT NULL THEN
+                    raise_application_error(-20101, l_sqlerror);
+                ELSE
+                    raise_application_error(-20100, sqlerrm);
+                END IF;
+
+        END;
 
         l_output_clob                      := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response), p_xpath => '//runDataModelInSessionResponse/runDataModelInSessionReturn/reportBytes/text()'
                                                        , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
 
         p_bip_output.output_content_xml    := apex_web_service.clobbase642blob(l_output_clob);
-        p_bip_output.dp_profile            := apex_data_parser.discover(p_content => p_bip_output.output_content_xml
-                                                           , p_file_name => c_dummy_xml_filename
-                                                           , p_row_selector => '/ROWSET/ROW');
+        BEGIN
+            p_bip_output.dp_profile := apex_data_parser.discover(p_content => p_bip_output.output_content_xml
+                                                               , p_file_name => c_dummy_xml_filename
+                                                               , p_row_selector => '/ROWSET/ROW');
+        EXCEPTION
+            WHEN OTHERS THEN
+                IF instr(sqlerrm, 'ORA-20987: No columns found for row selector "."') > 0 THEN
+                    raise_application_error(-20102, 'Data model returns no results.');
+                ELSE
+                    raise_application_error(-20100, sqlerrm);
+                END IF;
+        END;
 
     END retrieve_dm_data;
 
@@ -723,11 +736,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     FUNCTION is_credential_valid (
         p_credentials IN cmn_credentials_pkg.acct_creds
     ) RETURN BOOLEAN IS
-        l_payload    CLOB;
-        l_http_code  NUMBER;
-        l_response   CLOB;
-        l_error      CLOB;
-        l_result     VARCHAR2(30);
+        l_payload   CLOB;
+        l_response  CLOB;
+        l_result    VARCHAR2(30);
     BEGIN
         l_payload  := apex_string.format('<v2:validateLogin>
          <v2:userID>%0</v2:userID>
@@ -750,12 +761,60 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         END IF;
     END is_credential_valid;
 
+    PROCEDURE create_folder (
+        p_path         IN VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+    ) IS
+        l_payload   CLOB;
+        l_response  CLOB;
+        l_result    VARCHAR2(30);
+    BEGIN
+        IF p_credentials.session_token IS NULL THEN
+            retrieve_session_token(p_credentials);
+        END IF;
+        --
+
+        l_payload  := apex_string.format('<v2:objectExistInSession>
+         <v2:reportObjectAbsolutePath>%0</v2:reportObjectAbsolutePath>
+         <v2:bipSessionToken>%1</v2:bipSessionToken>
+      </v2:objectExistInSession>'
+                                      , trim(TRAILING '/' FROM p_path)
+                                          || '/'
+                                      , p_credentials.session_token);
+        --
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
+
+        l_result   := apex_web_service.parse_xml(p_xml => xmltype.createxml(l_response), p_xpath => '//objectExistInSessionResponse/objectExistInSessionReturn/text()'
+                                             , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
+
+        IF upper(l_result) = 'TRUE' THEN
+            RETURN; -- folder already exists
+        ELSE
+            l_payload := apex_string.format('<v2:createFolderInSession>
+         <v2:folderAbsolutePath>%0</v2:folderAbsolutePath>
+         <v2:bipSessionToken>%1</v2:bipSessionToken>
+      </v2:createFolderInSession>'
+                                          , trim(TRAILING '/' FROM p_path)
+                                              || '/'
+                                          , p_credentials.session_token);
+        --
+            send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                            , p_payload => l_payload
+                            , p_response => l_response);
+
+        END IF;
+
+    END create_folder;
+
     PROCEDURE create_data_model (
         p_path         IN  VARCHAR2
       , p_name         IN  VARCHAR2
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
       , p_sql          IN  CLOB DEFAULT NULL
       , p_xdm_xml      IN  CLOB DEFAULT NULL
+      , p_data_source  IN  VARCHAR DEFAULT 'ApplicationDB_HCM'
       , p_replace      IN  VARCHAR2 DEFAULT 'N'
     ) IS
         l_xdm_xml CLOB;
@@ -786,7 +845,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         END IF;
 
-        l_xdm_xml := nvl(p_xdm_xml, get_dm_for_sql(p_sql));
+        l_xdm_xml := nvl(p_xdm_xml, get_dm_for_sql(p_sql, p_data_source => p_data_source));
         post_data_model(p_path => p_path, p_name => p_name, p_credentials => p_credentials
                       , p_xdm_xml => l_xdm_xml);
 
