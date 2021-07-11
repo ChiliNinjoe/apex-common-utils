@@ -16,9 +16,11 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
     c_dummy_xml_filename CONSTANT VARCHAR2(60) := 'bipoutput.xml';
     --
-    TYPE bip_output IS RECORD (
-        output_content_xml  BLOB
-        , dp_profile          CLOB
+    TYPE file_content_rec IS RECORD (
+        blob_content  BLOB
+        , clob_copy     CLOB
+        , dp_profile    CLOB
+        , row_selector  VARCHAR2(4000)
     );
 
     FUNCTION clob_to_blob (
@@ -29,6 +31,9 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     -- Author       : Tim Hall
     -- Description  : Converts a CLOB to a BLOB.
     -- Last Modified: 26/12/2016
+    --
+    -- Modifications:
+    --   * Return null if input is null
     -- -----------------------------------------------------------------------------------
      AS
 
@@ -38,6 +43,10 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         l_lang_context  PLS_INTEGER := dbms_lob.default_lang_ctx;
         l_warning       PLS_INTEGER := dbms_lob.warn_inconvertible_char;
     BEGIN
+        IF p_data IS NULL THEN
+            RETURN NULL;
+        END IF;
+        --
         dbms_lob.createtemporary(lob_loc => l_blob, cache => true);
         dbms_lob.converttoblob(dest_lob => l_blob, src_clob => p_data, amount => dbms_lob.lobmaxsize
                              , dest_offset => l_dest_offset
@@ -208,6 +217,50 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 </dataModel>';
     END get_dm_for_sql;
 
+    PROCEDURE retrieve_folder_contents (
+        p_path             IN VARCHAR2
+      , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+      , p_folder_contents  IN OUT NOCOPY file_content_rec
+    ) IS
+        l_payload   CLOB;
+        l_response  CLOB;
+        l_result    CLOB;
+    BEGIN
+        IF p_credentials.session_token IS NULL THEN
+            retrieve_session_token(p_credentials);
+        END IF;
+        --
+
+        l_payload  := apex_string.format('<v2:getFolderContentsInSession>
+         <v2:folderAbsolutePath>%0</v2:folderAbsolutePath>
+         <v2:bipSessionToken>%1</v2:bipSessionToken>
+      </v2:getFolderContentsInSession>'
+                                      , trim(TRAILING '/' FROM p_path)
+                                          || '/'
+                                      , p_credentials.session_token);
+        --
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
+
+        l_result   := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response)
+                                                  , p_xpath => '//getFolderContentsInSessionResponse/getFolderContentsInSessionReturn/catalogContents'
+                                                  , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
+
+        l_result   := replace(l_result, ' xmlns="http://xmlns.oracle.com/oxp/service/v2"'); -- remove namespace
+
+        IF l_result IS NOT NULL THEN
+            p_folder_contents.blob_content    := clob_to_blob(l_result);
+            p_folder_contents.clob_copy       := l_result;
+            p_folder_contents.row_selector    := '/catalogContents/item';
+            p_folder_contents.dp_profile      := apex_data_parser.discover(p_content => p_folder_contents.blob_content
+                                                                    , p_file_name => c_dummy_xml_filename
+                                                                    , p_row_selector => p_folder_contents.row_selector);
+
+        END IF;
+
+    END retrieve_folder_contents;
+
     FUNCTION data_model_exists (
         p_path         IN  VARCHAR2
       , p_name         IN  VARCHAR2
@@ -320,7 +373,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_name         IN   VARCHAR2
       , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
       , p_parameters   IN   apex_t_varchar2 DEFAULT NULL
-      , p_bip_output   OUT  bip_output
+      , p_bip_output   OUT  file_content_rec
     ) IS
 
         l_param_node   CLOB;
@@ -353,7 +406,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         END IF;
 
-        l_payload                          := apex_string.format('<v2:runDataModelInSession>
+        l_payload                    := apex_string.format('<v2:runDataModelInSession>
          <v2:reportRequest>
             %0
             <v2:reportAbsolutePath>%1</v2:reportAbsolutePath>
@@ -384,14 +437,16 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         END;
 
-        l_output_clob                      := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response), p_xpath => '//runDataModelInSessionResponse/runDataModelInSessionReturn/reportBytes/text()'
+        l_output_clob                := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response), p_xpath => '//runDataModelInSessionResponse/runDataModelInSessionReturn/reportBytes/text()'
                                                        , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
 
-        p_bip_output.output_content_xml    := apex_web_service.clobbase642blob(l_output_clob);
+        p_bip_output.blob_content    := apex_web_service.clobbase642blob(l_output_clob);
         BEGIN
-            p_bip_output.dp_profile := apex_data_parser.discover(p_content => p_bip_output.output_content_xml
+            p_bip_output.row_selector    := '/ROWSET/ROW';
+            p_bip_output.dp_profile      := apex_data_parser.discover(p_content => p_bip_output.blob_content
                                                                , p_file_name => c_dummy_xml_filename
-                                                               , p_row_selector => '/ROWSET/ROW');
+                                                               , p_row_selector => p_bip_output.row_selector);
+
         EXCEPTION
             WHEN OTHERS THEN
                 IF instr(sqlerrm, 'ORA-20987: No columns found for row selector "."') > 0 THEN
@@ -402,6 +457,44 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         END;
 
     END retrieve_dm_data;
+
+    FUNCTION get_object (
+        p_path         IN  VARCHAR2
+      , p_name         IN  VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+    ) RETURN XMLTYPE IS
+        l_payload     CLOB;
+        l_response    CLOB;
+        l_object_b64  CLOB;
+        l_object      XMLTYPE;
+    BEGIN
+        IF p_credentials.session_token IS NULL THEN
+            retrieve_session_token(p_credentials);
+        END IF;
+        --
+
+        l_payload     := apex_string.format('<v2:getObjectInSession>
+         <v2:objectAbsolutePath>%0</v2:objectAbsolutePath>
+         <v2:bipSessionToken>%1</v2:bipSessionToken>
+      </v2:getObjectInSession>'
+                                      , trim(TRAILING '/' FROM p_path)
+                                          || '/'
+                                          || p_name
+                                      , p_credentials.session_token);
+                                         
+
+        --
+        send_soap_request(p_endpoint => get_catalogservice_url(p_credentials), p_caller => utl_call_stack.subprogram(1)(2)
+                        , p_payload => l_payload
+                        , p_response => l_response);
+
+        l_object_b64  := apex_web_service.parse_xml_clob(p_xml => xmltype.createxml(l_response), p_xpath => '//getObjectInSessionResponse/getObjectInSessionReturn/text()'
+                                                      , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/service/v2"');
+
+        l_object      := xmltype.createxml(xmldata => apex_web_service.clobbase642blob(l_object_b64), csid => 873, schema => NULL);
+
+        RETURN l_object;
+    END get_object;
 
     FUNCTION get_column_ddl (
         p_dp_profile IN CLOB
@@ -461,7 +554,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
     PROCEDURE load_table_from_xml (
         p_schema_name  IN   VARCHAR2
       , p_table_name   IN   VARCHAR2
-      , p_bip_output   IN   bip_output
+      , p_bip_output   IN   file_content_rec
       , p_errlog_tbl   IN   VARCHAR2 DEFAULT NULL
       , p_rows         OUT  NUMBER
     ) IS
@@ -651,7 +744,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                         || apex_string.join(l_selectcol, ',')
                         || '
         FROM
-            TABLE ( apex_data_parser.parse(p_content => :fileblob, p_file_name => :filename, p_file_profile => :fileprofile, p_row_selector => ''/ROWSET/ROW'') )';
+            TABLE ( apex_data_parser.parse(p_content => :fileblob, p_file_name => :filename, p_file_profile => :fileprofile, p_row_selector => :row_selector) )';
 
         IF p_errlog_tbl IS NOT NULL THEN
             l_insert_sql := l_insert_sql
@@ -666,7 +759,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         apex_debug.message('l_insert_sql: [%s]', l_insert_sql);
         EXECUTE IMMEDIATE l_insert_sql
-            USING p_bip_output.output_content_xml, c_dummy_xml_filename, p_bip_output.dp_profile;
+            USING p_bip_output.blob_content, c_dummy_xml_filename, p_bip_output.dp_profile, p_bip_output.row_selector;
         --
         p_rows        := SQL%rowcount;
         --
@@ -728,6 +821,56 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                         || apex_string.join_clob(l_selectcol, ',');
         p_column_labels  := apex_string.join_clob(l_colnames, ':');
     END generate_select_columns_for_collection;
+
+    PROCEDURE load_file_to_collection (
+        p_collection_name  IN  VARCHAR2
+      , p_file_rec         IN  file_content_rec
+      , p_empty_sql        IN  CLOB DEFAULT NULL
+      , p_empty_labels     IN  CLOB DEFAULT NULL
+    ) IS
+        l_select_sql     CLOB;
+        l_column_labels  CLOB;
+        l_sql_query      CLOB;
+    BEGIN
+        apex_collection.create_or_truncate_collection(p_collection_name => p_collection_name);
+        generate_select_columns_for_collection(p_dp_profile => p_file_rec.dp_profile
+                                             , p_select_sql => l_select_sql
+                                             , p_column_labels => l_column_labels);
+
+        IF p_file_rec.blob_content IS NOT NULL THEN
+            -- Add output LOBs to collection
+            apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'FILE_LOB'
+                                     , p_clob001 => p_file_rec.dp_profile
+                                     , p_blob001 => p_file_rec.blob_content);
+
+            -- Add SQL Query to collection
+            l_sql_query := l_select_sql
+                           || ' FROM apex_collections ac, TABLE ( apex_data_parser.parse(p_content => ac.blob001, p_file_name => ''dummy.xml'', p_file_profile => ac.clob001, p_row_selector => '''
+                           || p_file_rec.row_selector
+                           || ''') ) '
+                           || ' WHERE ac.collection_name = '''
+                           || p_collection_name
+                           || ''' AND c001 = ''FILE_LOB''';
+
+            apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'SELECT_QUERY'
+                                     , p_clob001 => l_sql_query);
+
+            -- Add column list to collection
+            apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'COLUMN_LIST'
+                                     , p_clob001 => l_column_labels);
+
+        ELSE
+            -- Add SQL Query to collection
+            apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'SELECT_QUERY'
+                                     , p_clob001 => p_empty_sql);
+
+            -- Add column list to collection
+            apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'COLUMN_LIST'
+                                     , p_clob001 => p_empty_labels);
+
+        END IF;
+
+    END load_file_to_collection;
 
     /**************************************************************************/
     /*************************** PUBLIC INTERFACE *****************************/
@@ -861,7 +1004,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_errlog_tbl   IN   VARCHAR2 DEFAULT NULL
       , p_rows         OUT  NUMBER
     ) IS
-        l_bip_output bip_output;
+        l_bip_output file_content_rec;
     BEGIN
         retrieve_dm_data(p_path => p_path, p_name => p_name, p_credentials => p_credentials
                        , p_parameters => p_parameters
@@ -881,10 +1024,7 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
       , p_parameters       IN  apex_t_varchar2 DEFAULT NULL
       , p_collection_name  IN  VARCHAR2
     ) IS
-        l_bip_output     bip_output;
-        l_select_sql     CLOB;
-        l_column_labels  CLOB;
-        l_sql_query      CLOB;
+        l_bip_output file_content_rec;
     BEGIN
         retrieve_dm_data(p_path => p_path, p_name => p_name, p_credentials => p_credentials
                        , p_parameters => p_parameters
@@ -892,33 +1032,59 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
 
         invalidate_session_token(p_credentials);
         --
-        apex_collection.create_or_truncate_collection(p_collection_name => p_collection_name);
-        generate_select_columns_for_collection(p_dp_profile => l_bip_output.dp_profile
-                                             , p_select_sql => l_select_sql
-                                             , p_column_labels => l_column_labels);
-
-        -- Add BIP output LOBs to collection
-        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'BIP_OUTPUT_LOB'
-                                 , p_clob001 => l_bip_output.dp_profile
-                                 , p_blob001 => l_bip_output.output_content_xml);
-
-        -- Add SQL Query to collection
-        l_sql_query := l_select_sql
-                       || ' FROM apex_collections ac, TABLE ( apex_data_parser.parse(p_content => ac.blob001, p_file_name => ''dummy.xml'', p_file_profile => ac.clob001, p_row_selector => ''/ROWSET/ROW'') ) '
-                       || ' WHERE ac.collection_name = '''
-                       || p_collection_name
-                       || ''' AND c001 = ''BIP_OUTPUT_LOB''';
-        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'SELECT_QUERY'
-                                 , p_clob001 => l_sql_query);
-
-        -- Add column list to collection
-        apex_collection.add_member(p_collection_name => p_collection_name, p_c001 => 'COLUMN_LIST'
-                                 , p_clob001 => l_column_labels);
-
+        load_file_to_collection(p_collection_name => p_collection_name, p_file_rec => l_bip_output);
     END load_data_model_to_collection;
 
+    PROCEDURE load_folder_contents_to_collection (
+        p_path             IN  VARCHAR2
+      , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+      , p_collection_name  IN  VARCHAR2
+    ) IS
+        l_folder_contents file_content_rec;
+    BEGIN
+        retrieve_folder_contents(p_path => p_path, p_credentials => p_credentials, p_folder_contents => l_folder_contents);
+        invalidate_session_token(p_credentials);
+        --
+
+        load_file_to_collection(p_collection_name => p_collection_name, p_file_rec => l_folder_contents
+                              , p_empty_sql => 'SELECT COL001 AS "ABSOLUTEPATH",COL002 AS "CREATIONDATE",COL003 AS "DISPLAYNAME",COL004 AS "FILENAME",COL005 AS "LASTMODIFIED",COL006 AS "LASTMODIFIER",COL007 AS "OWNER",COL008 AS "PARENTABSOLUTEPATH",COL009 AS "TYPE" FROM DUAL WHERE 1=0'
+                              , p_empty_labels => 'ABSOLUTEPATH:CREATIONDATE:DISPLAYNAME:FILENAME:LASTMODIFIED:LASTMODIFIER:OWNER:PARENTABSOLUTEPATH:TYPE');
+
+    END load_folder_contents_to_collection;
+
+    FUNCTION get_data_model_sql (
+        p_path         IN  VARCHAR2
+      , p_name         IN  VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+    ) RETURN CLOB IS
+        l_object_xml  XMLTYPE;
+        l_sql_node    CLOB;
+    BEGIN
+        IF data_model_exists(p_path => p_path, p_name => regexp_replace(p_name, '\.xdm$', ''
+                                                                      , 1, 1, 'i')
+                                                         || '.xdm'
+                           , p_credentials => p_credentials) THEN
+            l_object_xml := get_object(p_path => p_path, p_name => regexp_replace(p_name, '\.xdm$', ''
+                                                                                , 1, 1, 'i')
+                                                                   || '.xdm'
+                                     , p_credentials => p_credentials);
+        ELSE
+            RETURN NULL;
+        END IF;
+
+        invalidate_session_token(p_credentials);
+        --
+
+        l_sql_node := apex_web_service.parse_xml(p_xml => l_object_xml, p_xpath => '/dataModel/dataSets/dataSet/sql/text()'
+                                               , p_ns => 'xmlns="http://xmlns.oracle.com/oxp/xmlp"');
+
+        RETURN regexp_substr(l_sql_node, '<!\[CDATA\[(.*)\]\]>', 1
+                           , 1, 'in', 1);
+    END get_data_model_sql;
+
     FUNCTION get_query_for_collection (
-        p_collection_name IN VARCHAR2
+        p_collection_name     IN  VARCHAR2
+      , p_designtime_columns  IN  VARCHAR2 DEFAULT 'DUMMY'
     ) RETURN CLOB IS
         l_result CLOB;
     BEGIN
@@ -934,7 +1100,11 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         RETURN l_result;
     EXCEPTION
         WHEN no_data_found THEN
-            RETURN 'SELECT DUMMY FROM DUAL';
+            RETURN 'SELECT '
+                   || 'NULL AS "'
+                   || apex_string.join(apex_string.split(p_designtime_columns, ':'), '", NULL AS "')
+                   || '"'
+                   || ' FROM DUAL';
     END get_query_for_collection;
 
     FUNCTION get_columns_for_collection (
