@@ -1035,6 +1035,24 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
         load_file_to_collection(p_collection_name => p_collection_name, p_file_rec => l_bip_output);
     END load_data_model_to_collection;
 
+    FUNCTION get_data_model_xml (
+        p_path         IN  VARCHAR2
+      , p_name         IN  VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+      , p_parameters   IN  apex_t_varchar2 DEFAULT NULL
+    ) RETURN XMLTYPE IS
+        l_bip_output file_content_rec;
+    BEGIN
+        retrieve_dm_data(p_path => p_path, p_name => p_name, p_credentials => p_credentials
+                       , p_parameters => p_parameters
+                       , p_bip_output => l_bip_output);
+
+        invalidate_session_token(p_credentials);
+        --
+        RETURN xmltype.createxml(xmldata => l_bip_output.blob_content, csid => 873, schema => NULL);
+
+    END get_data_model_xml;
+
     PROCEDURE load_folder_contents_to_collection (
         p_path             IN  VARCHAR2
       , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
@@ -1065,7 +1083,8 @@ CREATE OR REPLACE PACKAGE BODY cmn_bip_utility_pkg AS
                                                          || '.xdm'
                            , p_credentials => p_credentials) THEN
             l_object_xml := get_object(p_path => p_path, p_name => regexp_replace(p_name, '\.xdm$', ''
-                                                                                , 1, 1, 'i')
+                                                                                , 1, 1
+                                                                                , 'i')
                                                                    || '.xdm'
                                      , p_credentials => p_credentials);
         ELSE

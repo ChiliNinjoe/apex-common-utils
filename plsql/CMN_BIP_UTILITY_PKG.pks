@@ -40,6 +40,13 @@ CREATE OR REPLACE PACKAGE cmn_bip_utility_pkg AS
       , p_collection_name  IN  VARCHAR2
     );
 
+    FUNCTION get_data_model_xml (
+        p_path         IN  VARCHAR2
+      , p_name         IN  VARCHAR2
+      , p_credentials  IN OUT NOCOPY cmn_credentials_pkg.acct_creds
+      , p_parameters   IN  apex_t_varchar2 DEFAULT NULL
+    ) RETURN XMLTYPE;
+
     PROCEDURE load_folder_contents_to_collection (
         p_path             IN  VARCHAR2
       , p_credentials      IN OUT NOCOPY cmn_credentials_pkg.acct_creds
