@@ -1,3 +1,7 @@
+/********************************************************************/
+/*****  Script to reapply user roles after reinstalling an app  *****/
+/********************************************************************/
+
 -- Create backup of app user roles
 CREATE TABLE app_user_roles_bkup
     AS
