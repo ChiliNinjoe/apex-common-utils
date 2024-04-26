@@ -408,6 +408,12 @@ create or replace PACKAGE BODY cmn_hdl_utility_pkg IS
     /***************************** Private area *******************************/
     /**************************************************************************/
 
+    /**
+    * Constructs the WebCenter service URL based on the provided domain.
+    * 
+    * @param p_domain The domain to include in the service URL.
+    * @return The constructed WebCenter service URL as VARCHAR2.
+    */
     FUNCTION get_webcenter_url (
         p_domain IN VARCHAR2
     ) RETURN VARCHAR2 IS
@@ -418,6 +424,12 @@ create or replace PACKAGE BODY cmn_hdl_utility_pkg IS
                || '/idcws/GenericSoapPort';
     END get_webcenter_url;
 
+    /**
+    * Constructs the HCM Data Loader (HDL) service URL based on the provided domain.
+    * 
+    * @param p_domain The domain to include in the service URL.
+    * @return The constructed HDL service URL as VARCHAR2.
+    */
     FUNCTION get_hdl_url (
         p_domain IN VARCHAR2
     ) RETURN VARCHAR2 IS
@@ -428,6 +440,11 @@ create or replace PACKAGE BODY cmn_hdl_utility_pkg IS
                || '/hcmService/HCMDataLoader';
     END get_hdl_url;
 
+    /**
+    * Updates the HDL job record in the database with the provided job details.
+    * 
+    * @param p_job The HDL job record containing updated data.
+    */
     PROCEDURE update_job_record (
         p_job IN cmn_hdl_load_job_tbl%rowtype
     ) IS
@@ -464,6 +481,11 @@ create or replace PACKAGE BODY cmn_hdl_utility_pkg IS
     END update_job_record;
     
     /********************** Scheduler job processing **************************/
+    /**
+    * Monitors the specified HDL job, updating its status based on elapsed time and current processing state.
+    * 
+    * @param p_job_id The job ID to monitor.
+    */
     PROCEDURE monitor_job (
         p_job_id IN NUMBER
     ) IS
