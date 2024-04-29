@@ -4,7 +4,7 @@ import time
 from dotenv import load_dotenv
 import os
 
-class OAuth:
+class OAuth_Client:
     """
     A class to handle OAuth authentication.
     
@@ -74,7 +74,7 @@ class OAuth:
 
 if __name__ == '__main__':
     load_dotenv()
-    oauth = OAuth(os.environ['TOKEN_URL'],
+    oauth = OAuth_Client(os.environ['TOKEN_URL'],
                 os.environ['CLIENT_ID'],
                 os.environ['CLIENT_SECRET'])
     print(oauth.get_access_token())
