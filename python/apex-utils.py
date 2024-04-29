@@ -15,7 +15,7 @@ class OAuth:
         
         headers = {
             'Authorization': 'Bearer ' + oauth.get_access_token(),
-            'Content-Type': 'application/json',python 
+            'Content-Type': 'application/json', 
         }
         response = requests.get(api_url, headers=headers)
         if response.status_code == 200:
@@ -24,7 +24,7 @@ class OAuth:
             raise Exception("API request failed")
     """
 
-    def __init__(self, token_url, client_id, client_secret) -> None:
+    def __init__(self, token_url: str, client_id: str, client_secret: str) -> None:
         """
         Initializes the OAuth class with essential details.
 
@@ -39,7 +39,7 @@ class OAuth:
         self.access_token = None  # Variable to store the access token
         self.expire_time = None  # Variable to store the token's expiration time
     
-    def get_access_token(self):
+    def get_access_token(self) -> str:
         """
         Obtains the access token from the token URL.
         
