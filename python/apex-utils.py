@@ -65,7 +65,8 @@ class OAuth_Client:
             if response.status_code == 200:
                 # Parse the access token and its expiry from response
                 self.access_token = response.json().get('access_token')
-                self.expire_time = time.time() + int(response.json().get('expires_in'))
+                self.expire_time = time.time() + int(response.json().get('expires_in')) \
+                                    - 1 # expire 1 second earlier to account for potential delay in processing the response
                 return self.access_token
             else:
                 # Raise an exception if token couldn't be obtained
